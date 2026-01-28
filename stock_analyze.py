@@ -47,6 +47,19 @@ def get_full_market_tickers():
 
 # --- 2. 交易決策邏輯 (整合回測標準) ---
 def analyze_stock_advanced(ticker, weights, params):
+    """
+    多因子量化分析核心函數
+    
+    評分機制：
+    - RSI < 30 (超賣): +40分
+    - MA5 黃金交叉 MA10: +30分  
+    - 單日漲跌幅 >= 7%: +20分
+    - 成交量爆量 (>平均2倍): +10分
+    
+    動作判定邏輯：
+    1. 持倉時：依 ROI 與 RSI 判斷止損/獲利
+    2. 空倉時：總分達標且未超過最大加碼次數則建議買入
+    """
     try:
         df = yf.download(ticker, period="60d", interval="1d", progress=False, auto_adjust=True)
         if df.empty or len(df) < 20: return None
@@ -62,11 +75,13 @@ def analyze_stock_advanced(ticker, weights, params):
         
         # 評分邏輯
         score = 0
-        if c_rsi < 30: score += weights['rsi']
-        if float(prev['MA5']) < float(prev['MA10']) and float(curr['MA5']) > float(curr['MA10']): score += weights['ma']
+        if c_rsi < 30: score += weights['rsi']  # 超賣訊號
+        if float(prev['MA5']) < float(prev['MA10']) and float(curr['MA5']) > float(curr['MA10']): 
+            score += weights['ma']  # 黃金交叉
         chg = ((c_price - float(prev['Close'])) / float(prev['Close'])) * 100
-        if abs(chg) >= 7.0: score += weights['vol']
-        if float(curr['Volume']) > df['Volume'].mean() * 2: score += weights['vxx']
+        if abs(chg) >= 7.0: score += weights['vol']  # 大幅波動
+        if float(curr['Volume']) > df['Volume'].mean() * 2: 
+            score += weights['vxx']  # 成交量爆增
 
         # 動作判定 (結合持倉與回測參數)
         holdings = st.session_state.portfolio.get(ticker, [])
@@ -138,8 +153,60 @@ if page == "1. 全市場資金選股":
 # --- 頁面 2：決策 ---
 elif page == "2. 進階決策與持倉":
     st.title("🛡️ 進階量化決策中心")
+    
+    # ===== 新增：詳細交易策略說明 =====
+    with st.expander("📖 **交易策略詳細說明**", expanded=False):
+        st.markdown("""
+        ### 🎯 **多因子評分系統**
+        
+        本系統採用 **四大技術指標** 進行綜合評分（滿分100分）：
+        
+        | 指標 | 觸發條件 | 配分 | 說明 |
+        |------|---------|------|------|
+        | **RSI 相對強弱** | RSI < 30 | 40分 | 判斷超賣區間，反轉機會高 |
+        | **均線交叉** | MA5 黃金交叉 MA10 | 30分 | 短期趨勢向上突破 |
+        | **價格波動** | 單日漲跌幅 ≥ 7% | 20分 | 捕捉異常波動機會 |
+        | **成交爆量** | 當日量 > 平均量 2倍 | 10分 | 資金大量湧入訊號 |
+        
+        ---
+        
+        ### 📊 **買入/加碼策略**
+        
+        - **初次建倉**：總分 ≥ 30分 且無持倉 → 🟢 建議買入
+        - **分批加碼**：總分 ≥ 30分 且持倉批數 < 最大加碼次數 → 🟢 建議加碼
+        - **加碼上限**：系統會依據設定的「最大加碼次數」自動控制風險
+        
+        ---
+        
+        ### 🛡️ **風險控制機制**
+        
+        #### **止損條件** (優先級最高)
+        - 當 **投資報酬率(ROI) ≤ -止損百分比** 時 → 🚨 **立即止損賣出**
+        - 例如：設定止損 10%，持倉平均成本 100元，當價格跌至 90元以下觸發
+        
+        #### **獲利調節** (動態減倉)
+        - 當 **RSI > 部分調節RSI** (預設60) → 🟠 **部分減倉鎖定利潤**
+        - 適用於持倉已獲利但 RSI 尚未過熱
+        
+        #### **獲利清倉** (全數退出)
+        - 當 **RSI > 獲利清倉RSI** (預設80) → 🔵 **全部清倉獲利了結**
+        - 適用於極度超買區，避免獲利回吐
+        
+        ---
+        
+        ### ⚙️ **參數設定建議**
+        
+        - **保守型**：止損8%、加碼3次、部分調節RSI 55
+        - **平衡型**：止損10%、加碼5次、部分調節RSI 60 (預設)
+        - **積極型**：止損15%、加碼8次、部分調節RSI 65
+        
+        > ⚠️ **風險提示**：本策略為量化輔助工具，實際交易前請結合基本面分析與市場情緒判斷。
+        """)
+    
+    st.divider()
+    
     if 'top_100_list' not in st.session_state:
-        st.warning("請先執行第一頁掃描。")
+        st.warning("⚠️ 請先執行第一頁掃描以獲取股票池。")
     else:
         weights = {'rsi': 40, 'ma': 30, 'vol': 20, 'vxx': 10}
         params = {
@@ -157,28 +224,56 @@ elif page == "2. 進階決策與持倉":
         if signals:
             st.dataframe(pd.DataFrame(signals).sort_values("總分", ascending=False), use_container_width=True)
             
-            # 手動記錄買入
+            # ===== 修改：改為使用者手動輸入 =====
             st.divider()
+            st.subheader("📝 手動記錄持倉")
             c1, c2 = st.columns(2)
-            with c1: t_in = st.selectbox("選股代號", [s['代碼'] for s in signals])
-            with c2: p_in = st.number_input("買入價格", value=0.0)
+            
+            # 改為文字輸入框
+            with c1: 
+                t_in = st.text_input(
+                    "輸入股票代碼", 
+                    placeholder="例如：2330.TW",
+                    help="請輸入完整股票代碼，例如：2330.TW 或 1101.TW"
+                )
+            with c2: 
+                p_in = st.number_input(
+                    "買入價格", 
+                    value=0.0, 
+                    min_value=0.0,
+                    help="請輸入實際買入價格"
+                )
+            
             if st.button("➕ 更新持倉"):
-                if t_in not in st.session_state.portfolio: st.session_state.portfolio[t_in] = []
-                st.session_state.portfolio[t_in].append({"price": p_in, "date": str(datetime.now().date())})
-                save_portfolio(st.session_state.portfolio)
-                st.rerun()
+                if t_in and p_in > 0:
+                    if t_in not in st.session_state.portfolio: 
+                        st.session_state.portfolio[t_in] = []
+                    st.session_state.portfolio[t_in].append({
+                        "price": p_in, 
+                        "date": str(datetime.now().date())
+                    })
+                    save_portfolio(st.session_state.portfolio)
+                    st.success(f"✅ 成功記錄持倉：{t_in} @ ${p_in}")
+                    st.rerun()
+                else:
+                    st.error("❌ 請填寫有效的股票代碼和價格！")
 
     # --- 持倉顯示 ---
+    st.divider()
     st.subheader("💼 我的持倉紀錄")
     p_summary = []
     for k, v in st.session_state.portfolio.items():
         if v:
             avg = sum([i['price'] for i in v])/len(v)
             p_summary.append({"代號": k, "持倉批數": len(v), "平均成本": round(avg, 2)})
+    
     if p_summary:
         st.table(pd.DataFrame(p_summary))
         t_del = st.selectbox("移除標的", [d['代號'] for d in p_summary])
         if st.button("🗑️ 移除"):
             st.session_state.portfolio[t_del] = []
             save_portfolio(st.session_state.portfolio)
+            st.success(f"✅ 已移除 {t_del}")
             st.rerun()
+    else:
+        st.info("📭 目前沒有持倉記錄")
