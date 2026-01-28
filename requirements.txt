@@ -2,7 +2,7 @@ streamlit
 yfinance
 pandas
 pandas_ta
+numpy
 requests
 lxml
 html5lib
-plotly
