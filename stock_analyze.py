@@ -2,101 +2,21 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import time
 import random
 import requests
 import urllib3
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- 基礎配置 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股量化決策與回測系統", layout="wide")
+st.set_page_config(page_title="台股多因子決策系統 (加碼止損版)", layout="wide")
 
 DB_FILE = "portfolio.json"
 
-# --- 1. 回測核心類別 ---
-class RSITradingStrategy:
-    def __init__(self, df, rsi_period=14, oversold=20, overbought=80, 
-                 profit_take_rsi=60, profit_take_pct=0.3, 
-                 initial_capital=1000000, entry_pct=0.1,
-                 buy_fee_rate=0.001425, sell_fee_rate=0.004425,
-                 max_entries=5, stop_loss_pct=0.10):
-        self.df = df.copy()
-        self.rsi_period = rsi_period
-        self.oversold = oversold
-        self.overbought = overbought
-        self.profit_take_rsi = profit_take_rsi
-        self.profit_take_pct = profit_take_pct
-        self.initial_capital = initial_capital
-        self.entry_pct = entry_pct
-        self.buy_fee_rate = buy_fee_rate
-        self.sell_fee_rate = sell_fee_rate
-        self.max_entries = max_entries
-        self.stop_loss_pct = stop_loss_pct
-        self.trades = []
-
-    def calculate_indicators(self):
-        if isinstance(self.df.columns, pd.MultiIndex):
-            self.df.columns = self.df.columns.get_level_values(0)
-        self.df['RSI'] = ta.rsi(self.df['Close'], length=self.rsi_period)
-        self.df.dropna(inplace=True)
-
-    def run_backtest(self):
-        self.trades = []
-        cash = self.initial_capital
-        holdings = 0
-        inventory = [] 
-        equity_curve = [] 
-        actions = [] 
-        
-        for index, row in self.df.iterrows():
-            rsi_val = row['RSI']
-            price = row['Close']
-            action_code = 0 # 0:無, 1:買, 2:調節, -1:清倉, -2:止損
-            
-            # 止損邏輯
-            if holdings > 0:
-                avg_cost = sum(item['shares'] * item['price'] for item in inventory) / holdings
-                if (price - avg_cost) / avg_cost <= -self.stop_loss_pct:
-                    cash += holdings * price * (1 - self.sell_fee_rate)
-                    self.trades.append({'類型': '止損賣出', '時間': index, '報酬率': (price-avg_cost)/avg_cost})
-                    holdings, inventory, action_code = 0, [], -2
-
-            if action_code != -2:
-                # 清倉/調節/買入
-                if rsi_val > self.overbought and holdings > 0:
-                    cash += holdings * price * (1 - self.sell_fee_rate)
-                    holdings, inventory, action_code = 0, [], -1
-                elif rsi_val > self.profit_take_rsi and len(inventory) > 1:
-                    batches = max(1, int(len(inventory) * self.profit_take_pct))
-                    for _ in range(batches):
-                        if inventory:
-                            batch = inventory.pop(0)
-                            cash += batch['shares'] * price * (1 - self.sell_fee_rate)
-                            holdings -= batch['shares']
-                    action_code = 2
-                elif rsi_val < self.oversold and len(inventory) < self.max_entries:
-                    buy_val = self.initial_capital * self.entry_pct
-                    shares = int(min(buy_val, cash) / (price * (1 + self.buy_fee_rate)))
-                    if shares > 0:
-                        cash -= shares * price * (1 + self.buy_fee_rate)
-                        holdings += shares
-                        inventory.append({'shares': shares, 'price': price, 'time': index})
-                        action_code = 1
-            
-            actions.append(action_code)
-            equity_curve.append(cash + (holdings * price))
-
-        self.df['Action'] = actions
-        final_ret = (equity_curve[-1] - self.initial_capital) / self.initial_capital if equity_curve else 0
-        return final_ret, equity_curve[-1]
-
-# --- 2. 核心功能與資料管理 ---
+# 持倉管理
 def load_portfolio():
     if os.path.exists(DB_FILE):
         try:
@@ -109,9 +29,8 @@ def save_portfolio(data):
 
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = load_portfolio()
-if 'top_100_list' not in st.session_state:
-    st.session_state.top_100_list = []
 
+# --- 1. 全面獲取股票代碼 (全面模式) ---
 @st.cache_data(ttl=86400)
 def get_full_market_tickers():
     url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
@@ -121,98 +40,145 @@ def get_full_market_tickers():
         df = pd.read_html(res.text)[0]
         df.columns = df.iloc[0]
         df = df[df['有價證券代號及名稱'].str.contains("  ", na=False)]
-        return [f"{t.split('  ')[0].strip()}.TW" for t in df['有價證券代號及名稱'] if len(t.split('  ')[0].strip()) == 4]
-    except:
-        return [f"{i:04d}.TW" for i in range(1101, 9999)]
+        tickers = [f"{t.split('  ')[0].strip()}.TW" for t in df['有價證券代號及名稱'] if len(t.split('  ')[0].strip()) == 4]
+        if len(tickers) > 800: return tickers
+    except: pass
+    return [f"{i:04d}.TW" for i in range(1101, 9999)]
 
-# --- 3. UI 頁面導航 ---
-page = st.sidebar.radio("功能選單", ["1. 全市場資金選股", "2. 進階決策與持倉", "3. 策略參數回測優化"])
+# --- 2. 交易決策邏輯 (整合回測標準) ---
+def analyze_stock_advanced(ticker, weights, params):
+    try:
+        df = yf.download(ticker, period="60d", interval="1d", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 20: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
+        df['RSI'] = ta.rsi(df['Close'], length=14)
+        df['MA5'] = ta.sma(df['Close'], length=5)
+        df['MA10'] = ta.sma(df['Close'], length=10)
+
+        curr, prev = df.iloc[-1], df.iloc[-2]
+        c_price = float(curr['Close'])
+        c_rsi = float(curr['RSI'])
+        
+        # 評分邏輯
+        score = 0
+        if c_rsi < 30: score += weights['rsi']
+        if float(prev['MA5']) < float(prev['MA10']) and float(curr['MA5']) > float(curr['MA10']): score += weights['ma']
+        chg = ((c_price - float(prev['Close'])) / float(prev['Close'])) * 100
+        if abs(chg) >= 7.0: score += weights['vol']
+        if float(curr['Volume']) > df['Volume'].mean() * 2: score += weights['vxx']
+
+        # 動作判定 (結合持倉與回測參數)
+        holdings = st.session_state.portfolio.get(ticker, [])
+        action = "觀望"
+        
+        if holdings:
+            avg_cost = sum([h['price'] for h in holdings]) / len(holdings)
+            roi = (c_price - avg_cost) / avg_cost
+            
+            # 止損判定
+            if roi <= -params['stop_loss_pct']: action = "🚨 止損賣出"
+            # RSI 獲利調節
+            elif c_rsi > params['profit_take_rsi']: action = "🟠 部分調節"
+            # RSI 全清倉
+            elif c_rsi > params['overbought_rsi']: action = "🔵 獲利清倉"
+        
+        # 買入/加碼判定 (檢查最大加碼次數)
+        if action == "觀望" and score >= params['buy_threshold']:
+            if len(holdings) < params['max_entries']:
+                action = "🟢 建議加碼" if len(holdings) > 0 else "🟢 建議買入"
+
+        return {
+            "代碼": ticker, "總分": score, "現價": round(c_price, 2),
+            "RSI": round(c_rsi, 1), "建議動作": action, "持倉批數": len(holdings)
+        }
+    except: return None
+
+# --- UI 導航 ---
+page = st.sidebar.radio("功能選單", ["1. 全市場資金選股", "2. 進階決策與持倉"])
+
+# 參數設定
+st.sidebar.divider()
+st.sidebar.header("⚙️ 交易策略參數")
+max_e = st.sidebar.number_input("最大加碼次數", 1, 10, 5)
+sl_pct = st.sidebar.slider("止損百分比 (%)", 5.0, 30.0, 10.0) / 100.0
+pt_rsi = st.sidebar.slider("部分調節 RSI", 40, 70, 60)
+ob_rsi = st.sidebar.slider("獲利清倉 RSI", 70, 95, 80)
+
+# --- 頁面 1：選股 ---
 if page == "1. 全市場資金選股":
     st.title("🏆 全市場資金指標排行")
     if st.button("🚀 執行深度掃描"):
         all_list = get_full_market_tickers()
         res_rank = []
-        p_bar = st.progress(0, text="正在獲取數據（關閉多線程模式以確保穩定）...")
+        p_bar = st.progress(0, text="分批下載中...")
         
-        # 修正：縮小批次，關閉 threads
-        batch_size = 20
-        for i in range(0, 200, batch_size): # 測試先取前200隻，可改回 len(all_list)
+        batch_size = 50
+        for i in range(0, len(all_list), batch_size):
             batch = all_list[i : i + batch_size]
             try:
-                # 關鍵修正點：threads=False
-                data = yf.download(batch, period="2d", group_by='ticker', threads=False, progress=False)
+                data = yf.download(batch, period="2d", group_by='ticker', threads=True, progress=False)
                 for t in batch:
                     try:
-                        t_df = data[t].dropna() if isinstance(data, pd.DataFrame) and len(batch)>1 else data.dropna()
+                        t_df = data[t].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
                         if not t_df.empty:
                             last = t_df.iloc[-1]
                             val = (float(last['Close']) * float(last['Volume'])) / 1e8
                             res_rank.append({"股票代號": t, "收盤價": float(last['Close']), "成交值(億)": val})
                     except: continue
             except: pass
-            p_bar.progress((i + batch_size) / 200)
-            time.sleep(0.5)
+            p_bar.progress(min((i + batch_size) / len(all_list), 1.0))
+            time.sleep(random.uniform(0.5, 1.0))
         
         if res_rank:
-            top_df = pd.DataFrame(res_rank).sort_values("成交值(億)", ascending=False).head(100)
-            st.session_state.top_100_list = top_df['股票代號'].tolist()
-            st.dataframe(top_df, use_container_width=True)
+            top_100 = pd.DataFrame(res_rank).sort_values("成交值(億)", ascending=False).head(100)
+            st.session_state.top_100_list = top_100['股票代號'].tolist()
+            st.dataframe(top_100, use_container_width=True)
 
+# --- 頁面 2：決策 ---
 elif page == "2. 進階決策與持倉":
     st.title("🛡️ 進階量化決策中心")
-    if not st.session_state.top_100_list:
+    if 'top_100_list' not in st.session_state:
         st.warning("請先執行第一頁掃描。")
     else:
-        results = []
-        for t in st.session_state.top_100_list[:20]: # 示範前20名
-            df = yf.download(t, period="60d", progress=False)
-            if not df.empty:
-                df['RSI'] = ta.rsi(df['Close'], length=14)
-                curr = df.iloc[-1]
-                results.append({"代碼": t, "現價": round(curr['Close'],2), "RSI": round(curr['RSI'],1)})
-        st.table(pd.DataFrame(results))
-
-elif page == "3. 策略參數回測優化":
-    st.title("📈 策略參數回測與調節優化")
-    
-    # 圖片上要求的介面功能
-    col_t1, col_t2 = st.columns(2)
-    held_tickers = list(st.session_state.portfolio.keys())
-    with col_t1:
-        ticker_sel = st.selectbox("快捷選取持倉股票", ["手動輸入"] + held_tickers)
-    with col_t2:
-        manual_ticker = st.text_input("或手動輸入股票代碼", value="2330.TW" if ticker_sel == "手動輸入" else ticker_sel)
-    
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.subheader("📊 RSI 設定")
-        r_period = st.slider("RSI 週期", 5, 30, 14)
-        r_buy = st.number_input("超賣買入線", value=20)
-        r_sell = st.number_input("超買清倉線", value=80)
-    with c2:
-        st.subheader("⚙️ 調節與止損")
-        r_pt_rsi = st.slider("部分調節 RSI", 40, 75, 60)
-        r_pt_pct = st.slider("調節比例(%)", 10, 90, 30) / 100
-        r_sl = st.slider("止損(%)", 5.0, 30.0, 10.0) / 100
-    with c3:
-        st.subheader("💰 資金管理")
-        init_cap = st.number_input("初始資金", value=1000000)
-        max_e = st.number_input("最大加碼次數", 1, 10, 5)
-
-    if st.button("🚀 執行精密回測"):
-        df_hist = yf.download(manual_ticker, period="1y", interval="1d", progress=False)
-        if not df_hist.empty:
-            strategy = RSITradingStrategy(df_hist, rsi_period=r_period, oversold=r_buy, overbought=r_sell, 
-                                         profit_take_rsi=r_pt_rsi, profit_take_pct=r_pt_pct, 
-                                         initial_capital=init_cap, max_entries=max_e, stop_loss_pct=r_sl)
-            strategy.calculate_indicators()
-            ret, final_v = strategy.run_backtest()
+        weights = {'rsi': 40, 'ma': 30, 'vol': 20, 'vxx': 10}
+        params = {
+            'max_entries': max_e, 'stop_loss_pct': sl_pct,
+            'profit_take_rsi': pt_rsi, 'overbought_rsi': ob_rsi, 'buy_threshold': 30
+        }
+        
+        signals = []
+        p_check = st.progress(0, text="計算指標中...")
+        for idx, t in enumerate(st.session_state.top_100_list):
+            res = analyze_stock_advanced(t, weights, params)
+            if res: signals.append(res)
+            p_check.progress((idx + 1) / 100)
+        
+        if signals:
+            st.dataframe(pd.DataFrame(signals).sort_values("總分", ascending=False), use_container_width=True)
             
-            st.metric("最終淨值", f"${final_v:,.0f}", f"{ret:.2%}")
-            
-            # 簡易走勢圖
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist['Close'], name="股價"))
-            st.plotly_chart(fig, use_container_width=True)
+            # 手動記錄買入
+            st.divider()
+            c1, c2 = st.columns(2)
+            with c1: t_in = st.selectbox("選股代號", [s['代碼'] for s in signals])
+            with c2: p_in = st.number_input("買入價格", value=0.0)
+            if st.button("➕ 更新持倉"):
+                if t_in not in st.session_state.portfolio: st.session_state.portfolio[t_in] = []
+                st.session_state.portfolio[t_in].append({"price": p_in, "date": str(datetime.now().date())})
+                save_portfolio(st.session_state.portfolio)
+                st.rerun()
+
+    # --- 持倉顯示 ---
+    st.subheader("💼 我的持倉紀錄")
+    p_summary = []
+    for k, v in st.session_state.portfolio.items():
+        if v:
+            avg = sum([i['price'] for i in v])/len(v)
+            p_summary.append({"代號": k, "持倉批數": len(v), "平均成本": round(avg, 2)})
+    if p_summary:
+        st.table(pd.DataFrame(p_summary))
+        t_del = st.selectbox("移除標的", [d['代號'] for d in p_summary])
+        if st.button("🗑️ 移除"):
+            st.session_state.portfolio[t_del] = []
+            save_portfolio(st.session_state.portfolio)
+            st.rerun()
