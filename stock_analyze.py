@@ -1,345 +1,266 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
-import time
-import random
+import numpy as np
 import requests
-import urllib3
-import json
-import os
-from datetime import datetime
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
-# --- 基礎配置 ---
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股多因子決策系統 (加碼止損版)", layout="wide")
+# --- API 設定 ---
+FINNHUB_API_KEY = "d5t2rvhr01qt62ngu1kgd5t2rvhr01qt62ngu1l0"
+st.set_page_config(page_title="AI 股市預測專家", layout="wide")
 
-DB_FILE = "portfolio.json"
-
-# 持倉管理
-def load_portfolio():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r") as f: return json.load(f)
-        except: return {}
-    return {}
-
-def save_portfolio(data):
-    with open(DB_FILE, "w") as f: json.dump(data, f, indent=4)
-
-if 'portfolio' not in st.session_state:
-    st.session_state.portfolio = load_portfolio()
-
-# --- 1. 全面獲取股票代碼 (全面模式) ---
-@st.cache_data(ttl=86400)
-def get_full_market_tickers():
-    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+# --- 1. 數據獲取 ---
+@st.cache_data(ttl=3600)
+def get_stock_data(symbol):
     try:
-        res = requests.get(url, timeout=10, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
-        res.encoding = 'big5'
-        df = pd.read_html(res.text)[0]
-        df.columns = df.iloc[0]
-        df = df[df['有價證券代號及名稱'].str.contains("  ", na=False)]
-        tickers = [f"{t.split('  ')[0].strip()}.TW" for t in df['有價證券代號及名稱'] if len(t.split('  ')[0].strip()) == 4]
-        if len(tickers) > 800: return tickers
-    except: pass
-    return [f"{i:04d}.TW" for i in range(1101, 9999)]
-
-# --- 2. 交易決策邏輯 (整合回測標準) ---
-def analyze_stock_advanced(ticker, weights, params):
-    """
-    多因子量化分析核心函數
-    
-    評分機制：
-    - RSI < 30 (超賣): +40分
-    - MA5 黃金交叉 MA10: +30分  
-    - 單日漲跌幅 >= 7%: +20分
-    - 成交量爆量 (>平均2倍): +10分
-    
-    動作判定邏輯：
-    1. 持倉時：依 ROI 與 RSI 判斷止損/獲利
-    2. 空倉時：總分達標且未超過最大加碼次數則建議買入
-    """
-    try:
-        df = yf.download(ticker, period="60d", interval="1d", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 20: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-
-        df['RSI'] = ta.rsi(df['Close'], length=14)
-        df['MA5'] = ta.sma(df['Close'], length=5)
-        df['MA10'] = ta.sma(df['Close'], length=10)
-
-        curr, prev = df.iloc[-1], df.iloc[-2]
-        c_price = float(curr['Close'])
-        c_rsi = float(curr['RSI'])
-        
-        # 評分邏輯 + 記錄原因
-        score = 0
-        reasons = []
-        
-        # RSI 超賣檢查
-        if c_rsi < 30: 
-            score += weights['rsi']
-            reasons.append(f"RSI超賣({c_rsi:.1f}<30, +{weights['rsi']}分)")
-        
-        # 均線交叉檢查
-        if float(prev['MA5']) < float(prev['MA10']) and float(curr['MA5']) > float(curr['MA10']): 
-            score += weights['ma']
-            reasons.append(f"MA5黃金交叉MA10(+{weights['ma']}分)")
-        
-        # 價格波動檢查
-        chg = ((c_price - float(prev['Close'])) / float(prev['Close'])) * 100
-        if abs(chg) >= 7.0: 
-            score += weights['vol']
-            reasons.append(f"單日波動{chg:+.2f}%(+{weights['vol']}分)")
-        
-        # 成交量檢查
-        vol_avg = df['Volume'].mean()
-        vol_ratio = float(curr['Volume']) / vol_avg
-        if vol_ratio > 2: 
-            score += weights['vxx']
-            reasons.append(f"成交量爆增{vol_ratio:.1f}倍(+{weights['vxx']}分)")
-
-        # 動作判定 (結合持倉與回測參數)
-        holdings = st.session_state.portfolio.get(ticker, [])
-        action = "觀望"
-        action_reason = ""
-        
-        if holdings:
-            avg_cost = sum([h['price'] for h in holdings]) / len(holdings)
-            roi = (c_price - avg_cost) / avg_cost
-            roi_pct = roi * 100
-            
-            # 止損判定
-            if roi <= -params['stop_loss_pct']: 
-                action = "🚨 止損賣出"
-                action_reason = f"虧損{roi_pct:.2f}%達止損線(-{params['stop_loss_pct']*100:.1f}%)"
-            
-            # RSI 獲利調節
-            elif c_rsi > params['profit_take_rsi']: 
-                action = "🟠 部分調節"
-                action_reason = f"RSI={c_rsi:.1f}超過調節線({params['profit_take_rsi']}), 獲利{roi_pct:+.2f}%"
-            
-            # RSI 全清倉
-            elif c_rsi > params['overbought_rsi']: 
-                action = "🔵 獲利清倉"
-                action_reason = f"RSI={c_rsi:.1f}極度超買(>{params['overbought_rsi']}), 獲利{roi_pct:+.2f}%"
-            
-            else:
-                action_reason = f"持倉{len(holdings)}批, 報酬{roi_pct:+.2f}%, 等待訊號"
-        
-        # 買入/加碼判定 (檢查最大加碼次數)
-        if action == "觀望" and score >= params['buy_threshold']:
-            if len(holdings) < params['max_entries']:
-                if len(holdings) > 0:
-                    action = "🟢 建議加碼"
-                    action_reason = f"評分{score}分達標(≥{params['buy_threshold']}), 可加碼第{len(holdings)+1}批(上限{params['max_entries']}批)"
-                else:
-                    action = "🟢 建議買入"
-                    action_reason = f"評分{score}分達標(≥{params['buy_threshold']}), 符合建倉條件"
-            else:
-                action_reason = f"評分{score}分達標但已達加碼上限({params['max_entries']}批)"
-        
-        # 組合技術指標理由
-        if reasons:
-            tech_reasons = " | ".join(reasons)
-        else:
-            tech_reasons = f"評分{score}分未達標(需≥{params['buy_threshold']})"
-        
-        # 最終建議理由
-        if action_reason:
-            final_reason = f"{action_reason} [{tech_reasons}]"
-        else:
-            final_reason = tech_reasons
-
-        return {
-            "代碼": ticker, 
-            "總分": score, 
-            "現價": round(c_price, 2),
-            "RSI": round(c_rsi, 1), 
-            "建議動作": action, 
-            "建議理由": final_reason,
-            "持倉批數": len(holdings)
-        }
-    except Exception as e:
+        df = yf.download(symbol, period="3mo", interval="1d", progress=False)
+        if df.empty: return None
+        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+        return df.reset_index()
+    except:
         return None
 
-# --- UI 導航 ---
-page = st.sidebar.radio("功能選單", ["1. 全市場資金選股", "2. 進階決策與持倉"])
-
-# 參數設定
-st.sidebar.divider()
-st.sidebar.header("⚙️ 交易策略參數")
-max_e = st.sidebar.number_input("最大加碼次數", 1, 10, 5)
-sl_pct = st.sidebar.slider("止損百分比 (%)", 5.0, 30.0, 10.0) / 100.0
-pt_rsi = st.sidebar.slider("部分調節 RSI", 40, 70, 60)
-ob_rsi = st.sidebar.slider("獲利清倉 RSI", 70, 95, 80)
-
-# --- 頁面 1：選股 ---
-if page == "1. 全市場資金選股":
-    st.title("🏆 全市場資金指標排行")
-    if st.button("🚀 執行深度掃描"):
-        all_list = get_full_market_tickers()
-        res_rank = []
-        p_bar = st.progress(0, text="分批下載中...")
-        
-        batch_size = 50
-        for i in range(0, len(all_list), batch_size):
-            batch = all_list[i : i + batch_size]
-            try:
-                data = yf.download(batch, period="2d", group_by='ticker', threads=True, progress=False)
-                for t in batch:
-                    try:
-                        t_df = data[t].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
-                        if not t_df.empty:
-                            last = t_df.iloc[-1]
-                            val = (float(last['Close']) * float(last['Volume'])) / 1e8
-                            res_rank.append({"股票代號": t, "收盤價": float(last['Close']), "成交值(億)": val})
-                    except: continue
-            except: pass
-            p_bar.progress(min((i + batch_size) / len(all_list), 1.0))
-            time.sleep(random.uniform(0.5, 1.0))
-        
-        if res_rank:
-            top_100 = pd.DataFrame(res_rank).sort_values("成交值(億)", ascending=False).head(100)
-            st.session_state.top_100_list = top_100['股票代號'].tolist()
-            st.dataframe(top_100, use_container_width=True)
-
-# --- 頁面 2：決策 ---
-elif page == "2. 進階決策與持倉":
-    st.title("🛡️ 進階量化決策中心")
+# --- 2. 改進的預測邏輯（使用固定種子確保一致性）---
+def predict_future_prices(df, sentiment_score, days=10):
+    """
+    改進版預測函數，使用固定隨機種子確保相同輸入產生相同輸出
+    """
+    # 設定固定隨機種子（基於股票最後價格和日期，確保穩定性）
+    last_price = df['Close'].iloc[-1]
+    last_date = df['Date'].iloc[-1]
+    seed = int(last_price * 1000 + days)
+    np.random.seed(seed)
     
-    # 詳細交易策略說明
-    with st.expander("📖 **交易策略詳細說明**", expanded=False):
-        st.markdown("""
-        ### 🎯 **多因子評分系統**
-        
-        本系統採用 **四大技術指標** 進行綜合評分（滿分100分）：
-        
-        | 指標 | 觸發條件 | 配分 | 說明 |
-        |------|---------|------|------|
-        | **RSI 相對強弱** | RSI < 30 | 40分 | 判斷超賣區間，反轉機會高 |
-        | **均線交叉** | MA5 黃金交叉 MA10 | 30分 | 短期趨勢向上突破 |
-        | **價格波動** | 單日漲跌幅 ≥ 7% | 20分 | 捕捉異常波動機會 |
-        | **成交爆量** | 當日量 > 平均量 2倍 | 10分 | 資金大量湧入訊號 |
-        
-        ---
-        
-        ### 📊 **買入/加碼策略**
-        
-        - **初次建倉**：總分 ≥ 30分 且無持倉 → 🟢 建議買入
-        - **分批加碼**：總分 ≥ 30分 且持倉批數 < 最大加碼次數 → 🟢 建議加碼
-        - **加碼上限**：系統會依據設定的「最大加碼次數」自動控制風險
-        
-        ---
-        
-        ### 🛡️ **風險控制機制**
-        
-        #### **止損條件** (優先級最高)
-        - 當 **投資報酬率(ROI) ≤ -止損百分比** 時 → 🚨 **立即止損賣出**
-        - 例如：設定止損 10%，持倉平均成本 100元，當價格跌至 90元以下觸發
-        
-        #### **獲利調節** (動態減倉)
-        - 當 **RSI > 部分調節RSI** (預設60) → 🟠 **部分減倉鎖定利潤**
-        - 適用於持倉已獲利但 RSI 尚未過熱
-        
-        #### **獲利清倉** (全數退出)
-        - 當 **RSI > 獲利清倉RSI** (預設80) → 🔵 **全部清倉獲利了結**
-        - 適用於極度超買區，避免獲利回吐
-        
-        ---
-        
-        ### ⚙️ **參數設定建議**
-        
-        - **保守型**：止損8%、加碼3次、部分調節RSI 55
-        - **平衡型**：止損10%、加碼5次、部分調節RSI 60 (預設)
-        - **積極型**：止損15%、加碼8次、部分調節RSI 65
-        
-        > ⚠️ **風險提示**：本策略為量化輔助工具，實際交易前請結合基本面分析與市場情緒判斷。
-        """)
+    # 計算技術指標
+    volatility = df['Close'].pct_change().std() 
+    recent_trend = (df['Close'].iloc[-1] - df['Close'].iloc[-5]) / df['Close'].iloc[-5]  # 近5日趨勢
+    volume_change = (df['Volume'].iloc[-5:].mean() - df['Volume'].iloc[-20:-5].mean()) / df['Volume'].iloc[-20:-5].mean()
     
-    st.divider()
+    # 情緒影響因子
+    sentiment_bias = (sentiment_score - 0.5) * 0.015  # 降低情緒影響，更穩定
+    trend_bias = recent_trend * 0.3  # 趨勢延續因子
     
-    if 'top_100_list' not in st.session_state:
-        st.warning("⚠️ 請先執行第一頁掃描以獲取股票池。")
+    # 綜合偏差
+    total_bias = sentiment_bias + trend_bias
+    
+    future_dates = [last_date + timedelta(days=i) for i in range(1, days + 1)]
+    future_prices = []
+    
+    current_price = last_price
+    for i in range(days):
+        # 隨著時間衰減的趨勢影響
+        decay_factor = 0.95 ** i
+        adjusted_bias = total_bias * decay_factor
+        
+        # 隨機漫步 + 偏差
+        change_pct = np.random.normal(adjusted_bias, volatility)
+        current_price *= (1 + change_pct)
+        future_prices.append(current_price)
+    
+    # 重置隨機種子（避免影響其他隨機操作）
+    np.random.seed(None)
+    
+    return pd.DataFrame({'Date': future_dates, 'Close': future_prices}), {
+        'volatility': volatility,
+        'recent_trend': recent_trend,
+        'volume_change': volume_change,
+        'sentiment_bias': sentiment_bias,
+        'trend_bias': trend_bias,
+        'total_bias': total_bias
+    }
+
+# --- 3. 生成預測原因分析 ---
+def generate_prediction_reason(df, future_df, metrics, sentiment_score):
+    """
+    生成詳細的預測原因說明
+    """
+    reasons = []
+    
+    # 1. 價格變動分析
+    current_price = df['Close'].iloc[-1]
+    predicted_price = future_df['Close'].iloc[-1]
+    price_change_pct = ((predicted_price - current_price) / current_price) * 100
+    
+    if price_change_pct > 0:
+        direction = "📈 上漲"
+        color = "green"
     else:
-        weights = {'rsi': 40, 'ma': 30, 'vol': 20, 'vxx': 10}
-        params = {
-            'max_entries': max_e, 'stop_loss_pct': sl_pct,
-            'profit_take_rsi': pt_rsi, 'overbought_rsi': ob_rsi, 'buy_threshold': 30
-        }
-        
-        signals = []
-        p_check = st.progress(0, text="計算指標中...")
-        for idx, t in enumerate(st.session_state.top_100_list):
-            res = analyze_stock_advanced(t, weights, params)
-            if res: signals.append(res)
-            p_check.progress((idx + 1) / 100)
-        
-        if signals:
-            # 顯示表格，包含建議理由欄位
-            df_signals = pd.DataFrame(signals).sort_values("總分", ascending=False)
-            st.dataframe(
-                df_signals,
-                use_container_width=True,
-                column_config={
-                    "建議理由": st.column_config.TextColumn(
-                        "建議理由",
-                        width="large",
-                        help="系統分析後的詳細建議說明"
-                    )
-                }
-            )
-            
-            # 手動記錄持倉
-            st.divider()
-            st.subheader("📝 手動記錄持倉")
-            c1, c2 = st.columns(2)
-            
-            with c1: 
-                t_in = st.text_input(
-                    "輸入股票代碼", 
-                    placeholder="例如：2330.TW",
-                    help="請輸入完整股票代碼，例如：2330.TW 或 1101.TW"
-                )
-            with c2: 
-                p_in = st.number_input(
-                    "買入價格", 
-                    value=0.0, 
-                    min_value=0.0,
-                    help="請輸入實際買入價格"
-                )
-            
-            if st.button("➕ 更新持倉"):
-                if t_in and p_in > 0:
-                    if t_in not in st.session_state.portfolio: 
-                        st.session_state.portfolio[t_in] = []
-                    st.session_state.portfolio[t_in].append({
-                        "price": p_in, 
-                        "date": str(datetime.now().date())
-                    })
-                    save_portfolio(st.session_state.portfolio)
-                    st.success(f"✅ 成功記錄持倉：{t_in} @ ${p_in}")
-                    st.rerun()
-                else:
-                    st.error("❌ 請填寫有效的股票代碼和價格！")
-
-    # --- 持倉顯示 ---
-    st.divider()
-    st.subheader("💼 我的持倉紀錄")
-    p_summary = []
-    for k, v in st.session_state.portfolio.items():
-        if v:
-            avg = sum([i['price'] for i in v])/len(v)
-            p_summary.append({"代號": k, "持倉批數": len(v), "平均成本": round(avg, 2)})
+        direction = "📉 下跌"
+        color = "red"
     
-    if p_summary:
-        st.table(pd.DataFrame(p_summary))
-        t_del = st.selectbox("移除標的", [d['代號'] for d in p_summary])
-        if st.button("🗑️ 移除"):
-            st.session_state.portfolio[t_del] = []
-            save_portfolio(st.session_state.portfolio)
-            st.success(f"✅ 已移除 {t_del}")
-            st.rerun()
+    reasons.append(f"### {direction} 預測：{abs(price_change_pct):.2f}%")
+    
+    # 2. 技術面分析
+    reasons.append("\n**📊 技術面因素：**")
+    
+    # 趨勢分析
+    if metrics['recent_trend'] > 0.02:
+        reasons.append(f"✓ 近期呈現上升趨勢 (+{metrics['recent_trend']*100:.2f}%)，慣性延續")
+    elif metrics['recent_trend'] < -0.02:
+        reasons.append(f"✓ 近期呈現下降趨勢 ({metrics['recent_trend']*100:.2f}%)，下行壓力存在")
     else:
-        st.info("📭 目前沒有持倉記錄")
+        reasons.append(f"✓ 近期橫盤整理，趨勢不明顯")
+    
+    # 波動率分析
+    if metrics['volatility'] > 0.03:
+        reasons.append(f"⚠ 高波動率 ({metrics['volatility']:.4f})，價格波動較大")
+    elif metrics['volatility'] < 0.015:
+        reasons.append(f"✓ 低波動率 ({metrics['volatility']:.4f})，價格相對穩定")
+    else:
+        reasons.append(f"✓ 中等波動率 ({metrics['volatility']:.4f})")
+    
+    # 成交量分析
+    if metrics['volume_change'] > 0.2:
+        reasons.append(f"✓ 成交量放大 (+{metrics['volume_change']*100:.1f}%)，市場關注度提升")
+    elif metrics['volume_change'] < -0.2:
+        reasons.append(f"⚠ 成交量萎縮 ({metrics['volume_change']*100:.1f}%)，交易意願降低")
+    
+    # 3. 情緒面分析
+    reasons.append("\n**🧠 市場情緒：**")
+    if sentiment_score > 0.6:
+        reasons.append(f"✓ 市場情緒偏多 ({sentiment_score:.2f})，利多氛圍濃厚")
+    elif sentiment_score < 0.4:
+        reasons.append(f"⚠ 市場情緒偏空 ({sentiment_score:.2f})，謹慎觀望氣氛")
+    else:
+        reasons.append(f"✓ 市場情緒中性 ({sentiment_score:.2f})，多空平衡")
+    
+    # 4. 綜合判斷
+    reasons.append("\n**🎯 綜合評估：**")
+    
+    confidence_factors = []
+    if abs(metrics['recent_trend']) > 0.03:
+        confidence_factors.append("趨勢明確")
+    if sentiment_score > 0.6 or sentiment_score < 0.4:
+        confidence_factors.append("情緒明顯")
+    if metrics['volume_change'] > 0.2:
+        confidence_factors.append("量能配合")
+    
+    if len(confidence_factors) >= 2:
+        confidence = "高"
+        conf_emoji = "🟢"
+    elif len(confidence_factors) == 1:
+        confidence = "中"
+        conf_emoji = "🟡"
+    else:
+        confidence = "低"
+        conf_emoji = "🔴"
+    
+    reasons.append(f"{conf_emoji} 預測可信度：**{confidence}** ({', '.join(confidence_factors) if confidence_factors else '訊號不足'})")
+    
+    # 5. 風險提示
+    reasons.append("\n**⚡ 風險提示：**")
+    if metrics['volatility'] > 0.03:
+        reasons.append("- 價格波動較大，建議設定停損")
+    if abs(metrics['volume_change']) > 0.3:
+        reasons.append("- 成交量異常變化，留意資金動向")
+    reasons.append("- 本預測僅供參考，投資前請自行評估風險")
+    
+    return "\n".join(reasons)
+
+# --- 3. Finnhub 情緒抓取 ---
+@st.cache_data(ttl=3600)
+def get_finnhub_sentiment(symbol):
+    clean_symbol = symbol.split('.')[0]
+    url = f"https://finnhub.io/api/v1/news-sentiment?symbol={clean_symbol}&token={FINNHUB_API_KEY}"
+    try:
+        res = requests.get(url).json()
+        return res
+    except: 
+        return None
+
+# --- UI 介面 ---
+st.title("📈 AI 股市趨勢分析與預測系統")
+st.markdown("*基於技術分析與市場情緒的智能預測模型*")
+
+# 側邊欄
+target_stock = st.sidebar.text_input("輸入股票代碼 (例: 2330.TW)", "2330.TW").upper()
+forecast_days = st.sidebar.slider("預測天數", 5, 10, 7)
+
+# 獲取數據
+df = get_stock_data(target_stock)
+sentiment_data = get_finnhub_sentiment(target_stock)
+sent_score = sentiment_data['sentiment'].get('bullishPercent', 0.5) if sentiment_data and 'sentiment' in sentiment_data else 0.5
+
+if df is not None:
+    # 執行預測
+    future_df, metrics = predict_future_prices(df, sent_score, days=forecast_days)
+    
+    # 生成預測原因
+    prediction_reason = generate_prediction_reason(df, future_df, metrics, sent_score)
+    
+    # 主要圖表
+    st.subheader(f"📊 {target_stock} 歷史走勢與 AI 預測路徑")
+    
+    fig = go.Figure()
+    
+    # 歷史 K 線
+    fig.add_trace(go.Candlestick(
+        x=df['Date'], 
+        open=df['Open'], 
+        high=df['High'],
+        low=df['Low'], 
+        close=df['Close'], 
+        name="歷史數據"
+    ))
+    
+    # 預測走勢（連接最後一天）
+    connect_df = pd.concat([df.tail(1)[['Date', 'Close']], future_df])
+    
+    fig.add_trace(go.Scatter(
+        x=connect_df['Date'], 
+        y=connect_df['Close'],
+        mode='lines+markers',
+        line=dict(color='orange', width=3, dash='dot'),
+        marker=dict(size=6),
+        name=f"AI 預測未來 {forecast_days} 日"
+    ))
+    
+    fig.update_layout(
+        xaxis_rangeslider_visible=False, 
+        height=600, 
+        template="plotly_dark",
+        hovermode='x unified'
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # --- 分析面板 ---
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.markdown("### 📉 數據摘要")
+        current_price = df['Close'].iloc[-1]
+        predicted_price = future_df['Close'].iloc[-1]
+        change = ((predicted_price - current_price) / current_price) * 100
+        
+        st.metric("當前價格", f"${current_price:.2f}")
+        st.metric(
+            f"{forecast_days} 日後預測價格", 
+            f"${predicted_price:.2f}",
+            f"{change:+.2f}%"
+        )
+        
+        # 技術指標
+        st.markdown("**技術指標：**")
+        st.write(f"- 波動率：`{metrics['volatility']:.4f}`")
+        st.write(f"- 5日趨勢：`{metrics['recent_trend']*100:+.2f}%`")
+        st.write(f"- 成交量變化：`{metrics['volume_change']*100:+.1f}%`")
+    
+    with col2:
+        st.markdown("### 🧠 AI 預測依據")
+        st.markdown(prediction_reason)
+    
+    # 詳細預測數據表
+    with st.expander("📅 查看每日預測明細"):
+        display_df = future_df.copy()
+        display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
+        display_df['價格'] = display_df['Close'].apply(lambda x: f"${x:.2f}")
+        display_df['變化%'] = display_df['Close'].pct_change().fillna(0).apply(lambda x: f"{x*100:+.2f}%")
+        st.dataframe(display_df[['Date', '價格', '變化%']], use_container_width=True)
+    
+    # 免責聲明
+    st.markdown("---")
+    st.caption("⚠️ **免責聲明**：本預測系統僅供學習與研究使用，不構成投資建議。股市有風險，投資需謹慎。")
+    
+else:
+    st.error("❌ 無法獲取數據，請檢查股票代碼格式是否正確。")
