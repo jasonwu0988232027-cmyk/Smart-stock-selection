@@ -73,41 +73,96 @@ def analyze_stock_advanced(ticker, weights, params):
         c_price = float(curr['Close'])
         c_rsi = float(curr['RSI'])
         
-        # 評分邏輯
+        # 評分邏輯 + 記錄原因
         score = 0
-        if c_rsi < 30: score += weights['rsi']  # 超賣訊號
+        reasons = []
+        
+        # RSI 超賣檢查
+        if c_rsi < 30: 
+            score += weights['rsi']
+            reasons.append(f"RSI超賣({c_rsi:.1f}<30, +{weights['rsi']}分)")
+        
+        # 均線交叉檢查
         if float(prev['MA5']) < float(prev['MA10']) and float(curr['MA5']) > float(curr['MA10']): 
-            score += weights['ma']  # 黃金交叉
+            score += weights['ma']
+            reasons.append(f"MA5黃金交叉MA10(+{weights['ma']}分)")
+        
+        # 價格波動檢查
         chg = ((c_price - float(prev['Close'])) / float(prev['Close'])) * 100
-        if abs(chg) >= 7.0: score += weights['vol']  # 大幅波動
-        if float(curr['Volume']) > df['Volume'].mean() * 2: 
-            score += weights['vxx']  # 成交量爆增
+        if abs(chg) >= 7.0: 
+            score += weights['vol']
+            reasons.append(f"單日波動{chg:+.2f}%(+{weights['vol']}分)")
+        
+        # 成交量檢查
+        vol_avg = df['Volume'].mean()
+        vol_ratio = float(curr['Volume']) / vol_avg
+        if vol_ratio > 2: 
+            score += weights['vxx']
+            reasons.append(f"成交量爆增{vol_ratio:.1f}倍(+{weights['vxx']}分)")
 
         # 動作判定 (結合持倉與回測參數)
         holdings = st.session_state.portfolio.get(ticker, [])
         action = "觀望"
+        action_reason = ""
         
         if holdings:
             avg_cost = sum([h['price'] for h in holdings]) / len(holdings)
             roi = (c_price - avg_cost) / avg_cost
+            roi_pct = roi * 100
             
             # 止損判定
-            if roi <= -params['stop_loss_pct']: action = "🚨 止損賣出"
+            if roi <= -params['stop_loss_pct']: 
+                action = "🚨 止損賣出"
+                action_reason = f"虧損{roi_pct:.2f}%達止損線(-{params['stop_loss_pct']*100:.1f}%)"
+            
             # RSI 獲利調節
-            elif c_rsi > params['profit_take_rsi']: action = "🟠 部分調節"
+            elif c_rsi > params['profit_take_rsi']: 
+                action = "🟠 部分調節"
+                action_reason = f"RSI={c_rsi:.1f}超過調節線({params['profit_take_rsi']}), 獲利{roi_pct:+.2f}%"
+            
             # RSI 全清倉
-            elif c_rsi > params['overbought_rsi']: action = "🔵 獲利清倉"
+            elif c_rsi > params['overbought_rsi']: 
+                action = "🔵 獲利清倉"
+                action_reason = f"RSI={c_rsi:.1f}極度超買(>{params['overbought_rsi']}), 獲利{roi_pct:+.2f}%"
+            
+            else:
+                action_reason = f"持倉{len(holdings)}批, 報酬{roi_pct:+.2f}%, 等待訊號"
         
         # 買入/加碼判定 (檢查最大加碼次數)
         if action == "觀望" and score >= params['buy_threshold']:
             if len(holdings) < params['max_entries']:
-                action = "🟢 建議加碼" if len(holdings) > 0 else "🟢 建議買入"
+                if len(holdings) > 0:
+                    action = "🟢 建議加碼"
+                    action_reason = f"評分{score}分達標(≥{params['buy_threshold']}), 可加碼第{len(holdings)+1}批(上限{params['max_entries']}批)"
+                else:
+                    action = "🟢 建議買入"
+                    action_reason = f"評分{score}分達標(≥{params['buy_threshold']}), 符合建倉條件"
+            else:
+                action_reason = f"評分{score}分達標但已達加碼上限({params['max_entries']}批)"
+        
+        # 組合技術指標理由
+        if reasons:
+            tech_reasons = " | ".join(reasons)
+        else:
+            tech_reasons = f"評分{score}分未達標(需≥{params['buy_threshold']})"
+        
+        # 最終建議理由
+        if action_reason:
+            final_reason = f"{action_reason} [{tech_reasons}]"
+        else:
+            final_reason = tech_reasons
 
         return {
-            "代碼": ticker, "總分": score, "現價": round(c_price, 2),
-            "RSI": round(c_rsi, 1), "建議動作": action, "持倉批數": len(holdings)
+            "代碼": ticker, 
+            "總分": score, 
+            "現價": round(c_price, 2),
+            "RSI": round(c_rsi, 1), 
+            "建議動作": action, 
+            "建議理由": final_reason,
+            "持倉批數": len(holdings)
         }
-    except: return None
+    except Exception as e:
+        return None
 
 # --- UI 導航 ---
 page = st.sidebar.radio("功能選單", ["1. 全市場資金選股", "2. 進階決策與持倉"])
@@ -154,7 +209,7 @@ if page == "1. 全市場資金選股":
 elif page == "2. 進階決策與持倉":
     st.title("🛡️ 進階量化決策中心")
     
-    # ===== 新增：詳細交易策略說明 =====
+    # 詳細交易策略說明
     with st.expander("📖 **交易策略詳細說明**", expanded=False):
         st.markdown("""
         ### 🎯 **多因子評分系統**
@@ -222,14 +277,25 @@ elif page == "2. 進階決策與持倉":
             p_check.progress((idx + 1) / 100)
         
         if signals:
-            st.dataframe(pd.DataFrame(signals).sort_values("總分", ascending=False), use_container_width=True)
+            # 顯示表格，包含建議理由欄位
+            df_signals = pd.DataFrame(signals).sort_values("總分", ascending=False)
+            st.dataframe(
+                df_signals,
+                use_container_width=True,
+                column_config={
+                    "建議理由": st.column_config.TextColumn(
+                        "建議理由",
+                        width="large",
+                        help="系統分析後的詳細建議說明"
+                    )
+                }
+            )
             
-            # ===== 修改：改為使用者手動輸入 =====
+            # 手動記錄持倉
             st.divider()
             st.subheader("📝 手動記錄持倉")
             c1, c2 = st.columns(2)
             
-            # 改為文字輸入框
             with c1: 
                 t_in = st.text_input(
                     "輸入股票代碼", 
