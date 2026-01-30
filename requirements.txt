@@ -1,11 +1,8 @@
 streamlit
+yfinance
 pandas
-numpy
-yfinance>=0.2.36
-gspread>=5.10.0
-google-auth>=2.20.0
-google-generativeai
+pandas_ta
 requests
-beautifulsoup4
-lxml
 urllib3
+gspread
+google-auth
