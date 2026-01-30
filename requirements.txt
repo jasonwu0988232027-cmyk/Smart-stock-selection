@@ -2,8 +2,7 @@ streamlit
 yfinance
 pandas
 pandas_ta
-numpy
 requests
-openpyxl
-lxml
 urllib3
+gspread
+google-auth
