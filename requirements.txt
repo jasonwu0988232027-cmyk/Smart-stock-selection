@@ -4,6 +4,6 @@ pandas
 pandas_ta
 numpy
 requests
+openpyxl
 lxml
-html5lib
-plotly
+urllib3
