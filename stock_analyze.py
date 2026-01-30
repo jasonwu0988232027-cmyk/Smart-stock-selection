@@ -1,136 +1,143 @@
 import streamlit as st
-import gspread
-import pandas as pd
 import yfinance as yf
+import pandas as pd
+import pandas_ta as ta
+import time
+import random
 import requests
 import urllib3
+import json
 import os
-import time
+import gspread
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
 # --- 基礎配置 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-SHEET_NAME = "Stock_Predictions_History"
+st.set_page_config(page_title="台股多因子決策系統 (雲端同步版)", layout="wide")
 
+# Google Sheets 配置
+SHEET_NAME = "Stock_Predictions_History" 
+# 讀取上傳的金鑰檔案名稱
+CREDENTIALS_JSON = "eco-precept-485904-j5-7ef3cdda1b03.json" 
+
+# --- Google Sheets 授權邏輯 ---
 def get_gspread_client():
-    """安全授權邏輯"""
+    """
+    建立 Google Sheets API 授權客戶端
+    """
     scopes = [
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
     ]
     
-    # 優先從 Streamlit Secrets 讀取 (雲端環境)
+    # 優先從 Streamlit Secrets 讀取，否則讀取本地 JSON
     if "gcp_service_account" in st.secrets:
         try:
-            creds_info = st.secrets["gcp_service_account"]
-            creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
             return gspread.authorize(creds)
         except Exception as e:
-            st.error(f"Cloud Auth Error: {e}")
+            st.error(f"Secrets Authorization Failed: {e}")
             return None
-    # 本地測試備案
-    elif os.path.exists("eco-precept-485904-j5-7ef3cdda1b03.json"):
-        creds = Credentials.from_service_account_file("eco-precept-485904-j5-7ef3cdda1b03.json", scopes=scopes)
-        return gspread.authorize(creds)
+    elif os.path.exists(CREDENTIALS_JSON):
+        try:
+            creds = Credentials.from_service_account_file(CREDENTIALS_JSON, scopes=scopes)
+            return gspread.authorize(creds)
+        except Exception as e:
+            st.error(f"Local JSON Authorization Failed: {e}")
+            return None
     return None
 
+def save_to_sheets(new_data, sheet_index=0):
+    """
+    將資料寫入 Google Sheets
+    """
+    client = get_gspread_client()
+    if client is None:
+        st.error("⚠️ Cannot connect to Google Sheets. Check credentials.")
+        return False
+        
+    try:
+        sh = client.open(SHEET_NAME)
+        all_ws = sh.worksheets()
+        if len(all_ws) > sheet_index:
+            target_ws = all_ws[sheet_index]
+        else:
+            target_ws = sh.add_worksheet(title=f"Market_Scan_{datetime.now().strftime('%Y%m%d')}", rows=1000, cols=10)
+        
+        # 檢查並寫入表頭 (針對本次全市場掃描格式)
+        if not target_ws.acell('A1').value:
+            headers = ["掃描日期", "股票代號", "收盤價", "成交值(億)"]
+            target_ws.append_row(headers)
+             
+        target_ws.append_rows(new_data)
+        return True
+    except Exception as e:
+        st.error(f"❌ Cloud Sync Failed: {str(e)}")
+        return False
+
+# --- 股票分析邏輯 ---
 @st.cache_data(ttl=86400)
 def get_full_market_tickers():
-    """步驟 1-1：調取股票市場全部的股票代碼"""
+    """
+    獲取台股上市股票代號
+    """
     url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
     try:
         res = requests.get(url, timeout=10, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
         res.encoding = 'big5'
         df = pd.read_html(res.text)[0]
         df.columns = df.iloc[0]
-        # 僅擷取 4 位數代碼的普通股
         df = df[df['有價證券代號及名稱'].str.contains("  ", na=False)]
         tickers = [f"{t.split('  ')[0].strip()}.TW" for t in df['有價證券代號及名稱'] if len(t.split('  ')[0].strip()) == 4]
         return tickers
     except:
-        return [f"{i:04d}.TW" for i in range(1101, 9999)]
+        return [f"{i:04d}.TW" for i in range(1101, 1200)] # 失敗時的回退機制
 
-# --- UI 與 執行 ---
-st.title("🏆 台股全市場資金排行系統 (修正版)")
-st.write("流程：1. 掃描全市場 (約1000+檔) -> 2. 篩選交易值前 100 名 -> 3. 同步至 Excel A-D 欄")
+# --- UI 介面 ---
+st.title("🏆 全市場資金指標排行與雲端同步")
 
-if st.button("🚀 執行全市場深度掃描"):
-    all_tickers = get_full_market_tickers()
-    client = get_gspread_client()
+if st.button("🚀 執行深度掃描並同步至雲端"):
+    all_list = get_full_market_tickers()
+    res_rank = []
+    upload_data = [] # 準備上傳至 Sheets 的格式
     
-    if client:
-        st.info(f"開始執行步驟 1：調取全市場 {len(all_tickers)} 檔股票資料...")
-        all_market_results = []
-        
-        # 使用進度條監控全市場掃描進度
-        p_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # 分批下載 (Batch Download) 以處理「全市場」資料
-        # 每批次下載 100 檔以平衡速度與穩定性
-        batch_size = 100
-        for i in range(0, len(all_tickers), batch_size):
-            batch = all_tickers[i : i + batch_size]
-            status_text.text(f"正在抓取第 {i} 至 {min(i+batch_size, len(all_tickers))} 檔...")
-            try:
-                # 下載 2 天資料確保獲取最新交易日
-                data = yf.download(batch, period="2d", group_by='ticker', threads=True, progress=False)
-                
-                for t in batch:
-                    try:
-                        # 處理多標的下載的 DataFrame 結構
-                        if isinstance(data.columns, pd.MultiIndex):
-                            t_df = data[t].dropna()
-                        else:
-                            t_df = data.dropna()
-                            
-                        if not t_df.empty:
-                            last_row = t_df.iloc[-1]
-                            price = float(last_row['Close'])
-                            vol = float(last_row['Volume'])
-                            # 計算交易值指標 (億)
-                            val_billion = (price * vol) / 1e8
-                            
-                            all_market_results.append({
-                                "日期": datetime.now().strftime('%Y-%m-%d'),
-                                "股票代號": t,
-                                "收盤價格": round(price, 2),
-                                "交易值指標": round(val_billion, 4)
-                            })
-                    except: continue
-            except Exception as e:
-                st.warning(f"批次 {i} 下載異常，已自動跳過。")
-                continue
+    p_bar = st.progress(0, text="正在分析全市場成交值...")
+    
+    # 為了演示與速度，範例僅抓取前 50 檔，正式使用可移除切片 [:50]
+    scan_list = all_list[:50] 
+    batch_size = 10
+    
+    for i in range(0, len(scan_list), batch_size):
+        batch = scan_list[i : i + batch_size]
+        try:
+            # 批量下載數據
+            data = yf.download(batch, period="2d", group_by='ticker', threads=True, progress=False)
+            current_date = datetime.now().strftime('%Y-%m-%d')
             
-            p_bar.progress(min((i + batch_size) / len(all_tickers), 1.0))
+            for t in batch:
+                try:
+                    t_df = data[t].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
+                    if not t_df.empty:
+                        last = t_df.iloc[-1]
+                        price = float(last['Close'])
+                        val = (price * float(last['Volume'])) / 1e8
+                        
+                        res_rank.append({"股票代號": t, "收盤價": price, "成交值(億)": val})
+                        # 構建 Google Sheets 列資料
+                        upload_data.append([current_date, t, price, round(val, 2)])
+                except: continue
+        except: pass
+        p_bar.progress(min((i + batch_size) / len(scan_list), 1.0))
+        time.sleep(random.uniform(0.1, 0.5))
+
+    if res_rank:
+        df_result = pd.DataFrame(res_rank).sort_values("成交值(億)", ascending=False)
+        st.subheader("本日掃描結果 (Top 50)")
+        st.dataframe(df_result, use_container_width=True)
         
-        status_text.text("步驟 1 完成！正在執行步驟 2：篩選前 100 名...")
-        
-        # --- 步驟 2：取市場中「交易值指標」前 100 的股票 ---
-        if all_market_results:
-            df_full = pd.DataFrame(all_market_results)
-            # 根據交易值指標降序排列並取前 100
-            df_top100 = df_full.sort_values(by="交易值指標", ascending=False).head(100)
-            
-            st.subheader("📊 全市場交易值前 100 名結果")
-            st.dataframe(df_top100, use_container_width=True)
-            
-            # 準備上傳 (嚴格對應 A-D 欄位：日期, 股票代號, 收盤價格, 交易值指標)
-            upload_list = df_top100[["日期", "股票代號", "收盤價格", "交易值指標"]].values.tolist()
-            
-            # 寫入 Google Sheets
-            try:
-                sh = client.open(SHEET_NAME)
-                ws = sh.get_worksheet(0)
-                
-                # 若為空表則寫入表頭
-                if not ws.acell('A1').value:
-                    ws.append_row(["日期", "股票代號", "收盤價格", "交易值指標"])
-                
-                ws.append_rows(upload_list)
-                st.success(f"✅ 已成功從全市場篩選出前 100 名，並同步至雲端 A-D 欄！")
-            except Exception as e:
-                st.error(f"雲端寫入失敗: {e}")
-        else:
-            st.error("未能成功調取任何市場資料，請檢查網路連線或 API 狀態。")
+        # 執行雲端同步
+        st.info("正在同步資料至 Google Sheets...")
+        if save_to_sheets(upload_data):
+            st.success(f"✅ 已成功將 {len(upload_data)} 筆資料同步至試算表: {SHEET_NAME}")
