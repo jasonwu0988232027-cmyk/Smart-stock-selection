@@ -6,6 +6,7 @@ import time
 import random
 import requests
 import urllib3
+import os
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
@@ -23,10 +24,11 @@ def get_full_market_tickers():
         res.encoding = 'big5'
         df = pd.read_html(res.text)[0]
         df.columns = df.iloc[0]
-        df = df[df['有價證券代號及名稱'].str.contains("  ", na=False)]
-        tickers = [f"{t.split('  ')[0].strip()}.TW" for t in df['有價證券代號及名稱'] if len(t.split('  ')[0].strip()) == 4]
+        df = df[df['有價證券代號及名稱'].str.contains("　", na=False)] # 注意：這裡是全形空格
+        tickers = [f"{t.split('　')[0].strip()}.TW" for t in df['有價證券代號及名稱'] if len(t.split('　')[0].strip()) == 4]
         if len(tickers) > 800: return tickers
     except: pass
+    # 如果爬蟲失敗，回傳保底清單
     return [f"{i:04d}.TW" for i in range(1101, 9999)]
 
 # --- 2. 輸出到 Excel ---
@@ -36,7 +38,7 @@ def export_to_excel(data, filename):
     sheet = wb.active
     sheet.title = "市場掃描結果"
     
-    # 設定標題
+    # 設定標題 (保持與你原本設計一致)
     headers = ["日期", "股票代碼", "實際收盤價"]
     for col_num, header in enumerate(headers, 1):
         cell = sheet.cell(row=1, column=col_num)
@@ -140,17 +142,19 @@ if page == "1. 全市場資金選股":
             st.session_state.top_100_list = top_100['股票代號'].tolist()
             st.dataframe(top_100, use_container_width=True)
             
-            # 輸出到 Excel
-            excel_file = "/mnt/user-data/outputs/market_scan_result.xlsx"
-            export_to_excel(res_rank, excel_file)
+            # --- 修正後的 Excel 輸出路徑 ---
+            # 移除了 /mnt/user-data/outputs/ 這種絕對路徑，改用當前目錄
+            excel_filename = f"market_scan_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            export_to_excel(res_rank, excel_filename)
+            
             st.success(f"✅ 已將掃描結果輸出至 Excel 檔案")
             
             # 提供下載連結
-            with open(excel_file, "rb") as f:
+            with open(excel_filename, "rb") as f:
                 st.download_button(
                     label="📥 下載 Excel 檔案",
                     data=f,
-                    file_name=f"market_scan_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    file_name=excel_filename,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
