@@ -5,9 +5,8 @@ import yfinance as yf
 import requests
 import urllib3
 import os
-import time
-from datetime import datetime, timedelta
 import pytz
+from datetime import datetime
 from google.oauth2.service_account import Credentials
 
 # --- 基礎配置 ---
@@ -15,32 +14,31 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SHEET_NAME = "Stock_Predictions_History"
 TZ = pytz.timezone('Asia/Taipei')
 
-def is_market_closed():
-    """判斷台股是否已收盤 (13:30) 且為工作日"""
+def check_execution_permission():
+    """
+    檢查當前時間是否允許執行並寫入 Excel
+    回傳: (可否執行 bool, 提示訊息 str)
+    """
     now = datetime.now(TZ)
-    weekday = now.weekday()  # 0-4 為週一至週五
-    close_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    weekday = now.weekday()  # 0=Mon, 6=Sun
+    current_time = now.time()
+    market_close_time = datetime.strptime("13:30", "%H:%M").time()
+
+    # 1. 檢查是否為週末
+    if weekday >= 5:
+        return False, "今日為週末，台股未開盤，系統不執行資料寫入。"
     
-    if weekday > 4:
-        return True, "今日為週末，顯示最後交易日數據。"
-    if now < close_time:
-        return False, f"台股尚未收盤。請於 13:30 之後再執行，當前時間: {now.strftime('%H:%M:%S')}"
-    return True, "盤後時段，開始抓取今日數據。"
+    # 2. 檢查是否已收盤
+    if current_time < market_close_time:
+        return False, f"台股尚未收盤（收盤時間 13:30），當前時間 {current_time.strftime('%H:%M')}，不執行更新。"
+    
+    return True, "盤後時段，准許執行資料更新。"
 
 def get_gspread_client():
-    """安全授權邏輯"""
-    scopes = [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/drive'
-    ]
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     if "gcp_service_account" in st.secrets:
-        try:
-            creds_info = st.secrets["gcp_service_account"]
-            creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-            return gspread.authorize(creds)
-        except Exception as e:
-            st.error(f"Cloud Auth Error: {e}")
-            return None
+        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+        return gspread.authorize(creds)
     elif os.path.exists("eco-precept-485904-j5-7ef3cdda1b03.json"):
         creds = Credentials.from_service_account_file("eco-precept-485904-j5-7ef3cdda1b03.json", scopes=scopes)
         return gspread.authorize(creds)
@@ -48,92 +46,80 @@ def get_gspread_client():
 
 @st.cache_data(ttl=3600)
 def get_full_market_tickers():
-    """步驟 1-1：調取股票市場全部的股票代碼"""
     url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
     try:
-        res = requests.get(url, timeout=10, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
+        res = requests.get(url, timeout=10, verify=False)
         res.encoding = 'big5'
         df = pd.read_html(res.text)[0]
         df.columns = df.iloc[0]
         df = df[df['有價證券代號及名稱'].str.contains("  ", na=False)]
-        tickers = [f"{t.split('  ')[0].strip()}.TW" for t in df['有價證券代號及名稱'] if len(t.split('  ')[0].strip()) == 4]
-        return tickers
+        return [f"{t.split('  ')[0].strip()}.TW" for t in df['有價證券代號及名稱'] if len(t.split('  ')[0].strip()) == 4]
     except:
-        return [f"{i:04d}.TW" for i in range(1101, 9999)]
+        return []
 
-# --- UI 與 執行 ---
-st.title("🏆 台股全市場資金排行系統 (增量更新版)")
+# --- Streamlit UI ---
+st.set_page_config(page_title="台股自動化同步系統", layout="wide")
+st.title("📊 台股全市場資金監控 (增量寫入版)")
 
-market_status, message = is_market_closed()
+can_execute, status_msg = check_execution_permission()
 
-if not market_status:
-    st.warning(f"⚠️ 暫停執行：{message}")
+if not can_execute:
+    st.error(f"🚫 系統鎖定：{status_msg}")
 else:
-    st.success(f"✅ 狀態：{message}")
-    if st.button("🚀 執行全市場深度掃描與更新"):
-        all_tickers = get_full_market_tickers()
+    st.success(f"✅ 系統就緒：{status_msg}")
+    
+    if st.button("🚀 開始掃描並存入 Excel"):
         client = get_gspread_client()
+        all_tickers = get_full_market_tickers()
         
-        if client:
-            st.info(f"開始掃描全市場 {len(all_tickers)} 檔股票...")
-            all_market_results = []
-            p_bar = st.progress(0)
-            status_text = st.empty()
-            
+        if client and all_tickers:
+            all_results = []
+            progress_bar = st.progress(0)
             today_str = datetime.now(TZ).strftime('%Y-%m-%d')
-            batch_size = 100
             
+            # --- 分批抓取數據 ---
+            batch_size = 100
             for i in range(0, len(all_tickers), batch_size):
                 batch = all_tickers[i : i + batch_size]
-                status_text.text(f"正在抓取第 {i} 至 {min(i+batch_size, len(all_tickers))} 檔...")
-                try:
-                    data = yf.download(batch, period="2d", group_by='ticker', threads=True, progress=False)
-                    for t in batch:
-                        try:
-                            t_df = data[t].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
-                            if not t_df.empty:
-                                last_row = t_df.iloc[-1]
-                                price = float(last_row['Close'])
-                                vol = float(last_row['Volume'])
-                                val_billion = (price * vol) / 1e8
-                                all_market_results.append({
-                                    "日期": today_str,
-                                    "股票代號": t,
-                                    "收盤價格": round(price, 2),
-                                    "交易值指標": round(val_billion, 4)
-                                })
-                        except: continue
-                except: continue
-                p_bar.progress(min((i + batch_size) / len(all_tickers), 1.0))
-            
-            if all_market_results:
-                df_new = pd.DataFrame(all_market_results).sort_values(by="交易值指標", ascending=False).head(100)
-                st.subheader(f"📊 {today_str} 交易值前 100 名")
-                st.dataframe(df_new, use_container_width=True)
+                data = yf.download(batch, period="2d", group_by='ticker', threads=True, progress=False)
                 
-                # --- 寫入 Google Sheets (增量/更新邏輯) ---
+                for t in batch:
+                    try:
+                        t_df = data[t].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
+                        if not t_df.empty:
+                            row = t_df.iloc[-1]
+                            all_results.append({
+                                "日期": today_str,
+                                "股票代號": t,
+                                "收盤價格": round(float(row['Close']), 2),
+                                "交易值指標": round((float(row['Close']) * float(row['Volume'])) / 1e8, 4)
+                            })
+                    except: continue
+                progress_bar.progress(min((i + batch_size) / len(all_tickers), 1.0))
+            
+            # --- 資料處理與寫入 ---
+            if all_results:
+                df_new = pd.DataFrame(all_results).sort_values(by="交易值指標", ascending=False).head(100)
+                
                 try:
                     sh = client.open(SHEET_NAME)
                     ws = sh.get_worksheet(0)
                     
-                    # 讀取現有資料
+                    # 獲取舊資料進行合併
                     existing_data = ws.get_all_records()
                     if existing_data:
                         df_history = pd.DataFrame(existing_data)
-                        # 移除日期重複的舊資料 (避免同一天重複執行產生冗餘)
-                        df_history = df_history[df_history['日期'] != today_str]
-                        # 合併新舊資料
+                        # 核心邏輯：若是同一天，則刪除舊記錄，確保不重疊
+                        df_history = df_history[df_history['日期'].astype(str) != today_str]
                         df_final = pd.concat([df_history, df_new], ignore_index=True)
                     else:
                         df_final = df_new
                     
-                    # 清除並重寫 (或先清空再重新上傳以保持排序與整潔)
+                    # 執行寫入
                     ws.clear()
-                    # 包含標頭寫入
                     ws.update([df_final.columns.values.tolist()] + df_final.values.tolist())
                     
-                    st.success(f"✅ 資料已更新！目前歷史總筆數: {len(df_final)}")
+                    st.dataframe(df_new)
+                    st.success(f"🎊 {today_str} 資料更新成功！Excel 總筆數：{len(df_final)}")
                 except Exception as e:
-                    st.error(f"雲端寫入失敗: {e}")
-            else:
-                st.error("未能獲取數據。")
+                    st.error(f"Excel 同步失敗: {e}")
