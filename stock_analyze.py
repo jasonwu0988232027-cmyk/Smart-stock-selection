@@ -358,8 +358,5 @@ with st.sidebar:
     st.divider()
     
     st.write("**技術資訊:**")
-    st.code("API URL:
-https://www.twse.com.tw/
-exchangeReport/
-STOCK_DAY_ALL?
-response=open_data", language="text")
+    st.code("""API URL:
+https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data""", language="text")
