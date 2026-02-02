@@ -1,6 +1,6 @@
 streamlit
 gspread
-pandas
+pandas>=2.0.0
 yfinance
 requests
 lxml
