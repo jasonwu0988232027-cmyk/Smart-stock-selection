@@ -35,10 +35,16 @@ def get_gspread_client():
         return gspread.authorize(creds)
     return None
 
-def get_hot_stocks_from_yahoo(limit=100):
-    """從 Yahoo 股市成交值排行榜抓取熱門股票"""
+def get_hot_stocks_from_yahoo_bs4(limit=100):
+    """使用 BeautifulSoup 解析 Yahoo 股市成交值排行榜 (不需要 html5lib)"""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        st.error("缺少 beautifulsoup4 套件，請安裝: pip install beautifulsoup4")
+        return None
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
     hot_tickers = []
@@ -48,50 +54,92 @@ def get_hot_stocks_from_yahoo(limit=100):
         url = "https://tw.stock.yahoo.com/rank/turnover?exchange=TAI"
         r = requests.get(url, headers=headers, timeout=10)
         
-        # 讀取網頁表格
-        dfs = pd.read_html(r.text)
-        if not dfs or len(dfs) == 0:
-            raise Exception("無法解析網頁表格")
+        if r.status_code != 200:
+            raise Exception(f"HTTP 狀態碼: {r.status_code}")
         
-        df = dfs[0]  # 抓取第一個表格
+        # 使用 BeautifulSoup 解析 (使用內建的 html.parser)
+        soup = BeautifulSoup(r.text, 'html.parser')
         
-        # 智慧偵測包含股名的欄位
-        target_col = None
-        for i, col_name in enumerate(df.columns):
-            if '股' in str(col_name) or '名' in str(col_name) or '代號' in str(col_name):
-                target_col = i
-                break
+        # Yahoo 的排行榜通常在特定的 div 或 table 中
+        # 嘗試找到所有包含股票代號的連結或文字
         
-        if target_col is None:
-            target_col = 1  # 預設第二欄
+        # 方法 1: 找尋所有可能是股票代號的 4 位數字
+        import re
+        text_content = soup.get_text()
+        # 找出所有 4 位數字
+        potential_tickers = re.findall(r'\b(\d{4})\b', text_content)
         
-        # 提取股票代號
-        count = 0
-        for item in df.iloc[:, target_col]:
-            item_str = str(item).strip()
-            
-            # 嘗試切割出代號 (例如 "2330 台積電" -> "2330")
-            parts = item_str.split(' ')
-            ticker = parts[0]
-            
-            # 過濾邏輯：只要 4 位數字
-            if ticker.isdigit() and len(ticker) == 4:
+        # 過濾：只保留台股常見的代號範圍 (1000-9999)
+        for ticker in potential_tickers:
+            ticker_num = int(ticker)
+            if 1000 <= ticker_num <= 9999 and f"{ticker}.TW" not in hot_tickers:
                 hot_tickers.append(f"{ticker}.TW")
-                count += 1
-            
-            if count >= limit:
-                break
+                if len(hot_tickers) >= limit:
+                    break
         
         if len(hot_tickers) > 0:
-            st.success(f"✅ 成功從 Yahoo 抓取 {len(hot_tickers)} 檔熱門股票")
+            st.success(f"✅ 成功從 Yahoo 抓取 {len(hot_tickers)} 檔股票")
             return hot_tickers
         else:
             raise Exception("未能解析出任何股票代號")
             
     except Exception as e:
         st.warning(f"⚠️ Yahoo 爬蟲失敗: {e}")
-        st.info("🛡️ 啟動備用股票清單...")
-        return get_fallback_list(limit)
+        return None
+
+def get_hot_stocks_from_yahoo_lxml(limit=100):
+    """使用 lxml 解析器 (pd.read_html 的替代方案)"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        st.info("🔍 正在從 Yahoo 股市抓取成交值排行榜 (使用 lxml)...")
+        url = "https://tw.stock.yahoo.com/rank/turnover?exchange=TAI"
+        r = requests.get(url, headers=headers, timeout=10)
+        
+        # 使用 lxml 解析器
+        dfs = pd.read_html(r.text, flavor='lxml')
+        
+        if not dfs or len(dfs) == 0:
+            raise Exception("無法解析網頁表格")
+        
+        df = dfs[0]
+        
+        # 智慧偵測包含股名的欄位
+        target_col = None
+        for i, col_name in enumerate(df.columns):
+            col_str = str(col_name).lower()
+            if '股' in col_str or '名' in col_str or '代號' in col_str or 'symbol' in col_str:
+                target_col = i
+                break
+        
+        if target_col is None:
+            target_col = 1  # 預設第二欄
+        
+        hot_tickers = []
+        for item in df.iloc[:, target_col]:
+            item_str = str(item).strip()
+            
+            # 嘗試切割出代號
+            parts = item_str.split()
+            ticker = parts[0] if parts else ""
+            
+            # 只要 4 位數字
+            if ticker.isdigit() and len(ticker) == 4:
+                hot_tickers.append(f"{ticker}.TW")
+                if len(hot_tickers) >= limit:
+                    break
+        
+        if hot_tickers:
+            st.success(f"✅ 成功從 Yahoo 抓取 {len(hot_tickers)} 檔股票")
+            return hot_tickers
+        else:
+            raise Exception("未能解析出任何股票代號")
+            
+    except Exception as e:
+        st.warning(f"⚠️ Yahoo 爬蟲 (lxml) 失敗: {e}")
+        return None
 
 def get_fallback_list(limit):
     """備用股票清單 - 手動維護的熱門股"""
@@ -103,13 +151,40 @@ def get_fallback_list(limit):
         # --- 航運/傳產 ---
         "2603.TW", "2609.TW", "2615.TW", "2618.TW", "2610.TW", "1513.TW", "1519.TW", "1504.TW", "1605.TW", "2002.TW",
         # --- 金融 ---
-        "2881.TW", "2882.TW", "2891.TW", "2886.TW", "2884.TW",
-        # --- 光電/面板/其他 ---
+        "2881.TW", "2882.TW", "2891.TW", "2886.TW", "2884.TW", "2887.TW", "2892.TW", "2880.TW", "2883.TW", "2890.TW",
+        # --- 光電/面板 ---
         "2409.TW", "3481.TW", "3008.TW", "2481.TW", "2344.TW", "2408.TW", "6770.TW", "5347.TW", "4961.TW", "9958.TW",
-        # --- 額外補充 ---
-        "2357.TW", "2379.TW", "2395.TW", "2412.TW", "2474.TW", "3008.TW", "3189.TW", "3711.TW", "4904.TW", "6505.TW"
+        # --- 電子零組件 ---
+        "2357.TW", "2379.TW", "2395.TW", "2412.TW", "2474.TW", "3189.TW", "3711.TW", "4904.TW", "6505.TW", "8046.TW",
+        # --- 電腦周邊 ---
+        "2301.TW", "2324.TW", "2353.TW", "2377.TW", "2392.TW", "3045.TW", "6239.TW", "6415.TW", "6669.TW", "8299.TW",
+        # --- 通信網路 ---
+        "2347.TW", "2393.TW", "2439.TW", "3044.TW", "3706.TW", "4938.TW", "6176.TW", "6531.TW", "8410.TW", "8454.TW",
+        # --- 其他電子 ---
+        "2323.TW", "2327.TW", "2337.TW", "2345.TW", "2351.TW", "2362.TW", "2371.TW", "2385.TW", "2404.TW", "2434.TW"
     ]
+    st.info(f"🛡️ 使用備用清單: {len(fallback[:limit])} 檔精選股票")
     return fallback[:limit]
+
+def get_hot_stocks(limit=100, force_fallback=False):
+    """整合方法：嘗試多種解析方式"""
+    
+    if force_fallback:
+        return get_fallback_list(limit)
+    
+    # 方法 1: 嘗試 lxml 解析器
+    tickers = get_hot_stocks_from_yahoo_lxml(limit)
+    if tickers and len(tickers) > 0:
+        return tickers
+    
+    # 方法 2: 嘗試 BeautifulSoup
+    tickers = get_hot_stocks_from_yahoo_bs4(limit)
+    if tickers and len(tickers) > 0:
+        return tickers
+    
+    # 方法 3: 使用備用清單
+    st.warning("⚠️ 所有爬蟲方法均失敗，使用備用清單")
+    return get_fallback_list(limit)
 
 def download_stock_data(tickers, period="1y"):
     """批次下載股票資料"""
@@ -140,18 +215,21 @@ def download_stock_data(tickers, period="1y"):
 def calculate_trading_values(tickers, data):
     """計算每支股票的交易值指標"""
     results = []
+    errors = []
     
     for ticker in tickers:
         try:
             # 處理多標的下載的資料結構
             if isinstance(data.columns, pd.MultiIndex):
                 if ticker not in data.columns.get_level_values(0):
+                    errors.append(f"{ticker}: 未在下載資料中")
                     continue
                 ticker_data = data[ticker].dropna()
             else:
                 ticker_data = data.dropna()
             
             if ticker_data.empty:
+                errors.append(f"{ticker}: 資料為空")
                 continue
             
             # 取最新一筆資料
@@ -159,6 +237,7 @@ def calculate_trading_values(tickers, data):
             
             # 檢查必要欄位
             if 'Close' not in ticker_data.columns or 'Volume' not in ticker_data.columns:
+                errors.append(f"{ticker}: 缺少必要欄位")
                 continue
             
             price = float(last_row['Close'])
@@ -166,6 +245,7 @@ def calculate_trading_values(tickers, data):
             
             # 過濾無效資料
             if price <= 0 or volume <= 0:
+                errors.append(f"{ticker}: 價格或成交量無效")
                 continue
             
             # 計算交易值 (億元)
@@ -180,14 +260,43 @@ def calculate_trading_values(tickers, data):
             })
             
         except Exception as e:
-            st.warning(f"處理 {ticker} 時發生錯誤: {str(e)[:50]}")
+            errors.append(f"{ticker}: {str(e)[:50]}")
             continue
     
-    return results
+    return results, errors
 
 # --- Streamlit UI ---
-st.title("🏆 台股熱門股資金排行系統 (Yahoo 版)")
+st.title("🏆 台股熱門股資金排行系統")
 st.write("**智慧流程：** Yahoo 成交榜 → 批次下載 → 計算交易值 → 排序前 100 → 同步雲端")
+
+# 檢查套件狀態
+with st.expander("🔧 套件檢查"):
+    packages_status = []
+    
+    try:
+        import lxml
+        packages_status.append("✅ lxml - 已安裝")
+    except:
+        packages_status.append("❌ lxml - 未安裝 (建議安裝)")
+    
+    try:
+        from bs4 import BeautifulSoup
+        packages_status.append("✅ beautifulsoup4 - 已安裝")
+    except:
+        packages_status.append("❌ beautifulsoup4 - 未安裝 (建議安裝)")
+    
+    try:
+        import html5lib
+        packages_status.append("✅ html5lib - 已安裝")
+    except:
+        packages_status.append("⚠️ html5lib - 未安裝 (可選)")
+    
+    for status in packages_status:
+        st.write(status)
+    
+    st.write("")
+    st.write("**安裝指令：**")
+    st.code("pip install lxml beautifulsoup4 html5lib")
 
 # 參數設定
 col1, col2, col3 = st.columns(3)
@@ -202,19 +311,16 @@ if st.button("🚀 開始執行分析"):
     # 步驟 1: 獲取股票清單
     st.subheader("📋 步驟 1: 獲取股票清單")
     
-    if use_fallback:
-        tickers = get_fallback_list(target_count)
-        st.info(f"使用備用清單: {len(tickers)} 檔股票")
-    else:
-        tickers = get_hot_stocks_from_yahoo(target_count)
+    tickers = get_hot_stocks(target_count, force_fallback=use_fallback)
     
-    if not tickers:
+    if not tickers or len(tickers) == 0:
         st.error("❌ 無法獲取股票清單")
         st.stop()
     
     # 顯示股票清單預覽
     with st.expander(f"🔍 查看股票清單 ({len(tickers)} 檔)"):
-        st.write(", ".join([t.replace('.TW', '') for t in tickers[:50]]))
+        preview = [t.replace('.TW', '') for t in tickers[:50]]
+        st.write(", ".join(preview))
         if len(tickers) > 50:
             st.write(f"... 還有 {len(tickers) - 50} 檔")
     
@@ -229,7 +335,7 @@ if st.button("🚀 開始執行分析"):
     # 步驟 3: 計算交易值
     st.subheader("📊 步驟 3: 計算交易值指標")
     with st.spinner("正在計算..."):
-        results = calculate_trading_values(tickers, market_data)
+        results, errors = calculate_trading_values(tickers, market_data)
     
     if not results:
         st.error("❌ 未能計算出任何有效資料")
@@ -237,6 +343,11 @@ if st.button("🚀 開始執行分析"):
         st.write("• 所有股票都沒有最新交易資料")
         st.write("• 今天可能是休市日")
         st.write("• 資料格式解析失敗")
+        
+        if errors:
+            with st.expander("查看錯誤詳情"):
+                for err in errors[:20]:
+                    st.text(err)
         st.stop()
     
     # 轉換為 DataFrame 並排序
@@ -248,7 +359,7 @@ if st.button("🚀 開始執行分析"):
     df_top = df_sorted.head(top_n)
     
     # 顯示結果
-    st.success(f"✅ 成功分析 {len(results)} 檔股票")
+    st.success(f"✅ 成功分析 {len(results)} 檔股票 ({len(errors)} 檔失敗)")
     
     # 統計資訊
     col1, col2, col3, col4 = st.columns(4)
@@ -266,6 +377,12 @@ if st.button("🚀 開始執行分析"):
     # 顯示前 100 名表格
     st.subheader(f"📊 交易值前 {top_n} 名")
     st.dataframe(df_top, use_container_width=True)
+    
+    # 錯誤資訊
+    if errors:
+        with st.expander(f"⚠️ 查看失敗記錄 ({len(errors)} 項)"):
+            for idx, err in enumerate(errors[:30], 1):
+                st.text(f"{idx}. {err}")
     
     # 步驟 4: 同步至 Google Sheets
     st.subheader("☁️ 步驟 4: 同步至 Google Sheets")
@@ -304,7 +421,7 @@ with st.sidebar:
     st.write("""
     **資料來源:**
     - 主要: Yahoo 股市成交值排行榜
-    - 備用: 手動維護的熱門股清單
+    - 備用: 手動維護的 100 檔熱門股清單
     
     **分析流程:**
     1. 抓取熱門股票代號
@@ -319,13 +436,6 @@ with st.sidebar:
     - 首次執行建議先測試較小數量
     """)
     
-    st.header("🔧 進階設定")
-    st.write("在 Streamlit Secrets 中設定:")
-    st.code("""
-[gcp_service_account]
-type = "service_account"
-project_id = "your-project"
-private_key_id = "..."
-private_key = "..."
-client_email = "..."
-    """)
+    st.header("🔧 套件安裝")
+    st.write("執行此指令安裝所需套件:")
+    st.code("pip install lxml beautifulsoup4 html5lib", language="bash")
