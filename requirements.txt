@@ -1,8 +1,12 @@
 streamlit
 gspread
-pandas>=2.0.0
+pandas
 yfinance
 requests
-lxml
-pytz
+urllib3
 google-auth
+google-auth-oauthlib
+google-auth-httplib2
+lxml
+beautifulsoup4
+html5lib
