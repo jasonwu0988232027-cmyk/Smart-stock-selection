@@ -1,8 +1,8 @@
 streamlit
-yfinance
-pandas
-pandas_ta
-requests
-urllib3
 gspread
+pandas
+yfinance
+requests
+lxml
+pytz
 google-auth
