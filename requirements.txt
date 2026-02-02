@@ -10,3 +10,5 @@ google-auth-httplib2
 lxml
 beautifulsoup4
 html5lib
+openpyxl
+xlrd
