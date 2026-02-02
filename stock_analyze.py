@@ -14,6 +14,26 @@ st.set_page_config(page_title="台股交易值分析系統", page_icon="📊", l
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SHEET_NAME = "Stock_Predictions_History"
 
+# 檢查必要的套件
+def check_excel_support():
+    """檢查 Excel 支援套件"""
+    engines = []
+    try:
+        import openpyxl
+        engines.append('openpyxl')
+    except ImportError:
+        pass
+    
+    try:
+        import xlsxwriter
+        engines.append('xlsxwriter')
+    except ImportError:
+        pass
+    
+    return engines
+
+EXCEL_ENGINES = check_excel_support()
+
 def get_gspread_client():
     """安全授權邏輯"""
     scopes = [
@@ -111,8 +131,46 @@ def process_twse_data(data, limit=100):
         st.error(f"❌ 資料處理失敗: {e}")
         return None
 
+def create_excel_file(df, filename="output.xlsx"):
+    """創建 Excel 檔案，自動選擇可用的引擎"""
+    output = BytesIO()
+    
+    # 優先使用 openpyxl，否則使用 xlsxwriter
+    if 'openpyxl' in EXCEL_ENGINES:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Sheet1')
+    elif 'xlsxwriter' in EXCEL_ENGINES:
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='Sheet1')
+    else:
+        # 如果都沒有，輸出 CSV
+        st.warning("⚠️ 缺少 Excel 支援套件，將輸出 CSV 格式")
+        output = BytesIO()
+        csv_data = df.to_csv(index=False).encode('utf-8-sig')
+        output.write(csv_data)
+        output.seek(0)
+        return output, "csv"
+    
+    output.seek(0)
+    return output, "xlsx"
+
 # --- 主程式 ---
 st.title("📊 台股交易值分析系統")
+
+# 顯示套件狀態
+if not EXCEL_ENGINES:
+    st.warning("""
+    ⚠️ **缺少 Excel 支援套件**  
+    請安裝以下任一套件以支援 Excel 功能：
+    ```
+    pip install openpyxl
+    ```
+    或
+    ```
+    pip install xlsxwriter
+    ```
+    目前系統將以 CSV 格式輸出檔案。
+    """)
 
 # 創建分頁
 tab1, tab2 = st.tabs(["🚀 市場掃描與排行", "📝 Excel 更新工具"])
@@ -206,14 +264,25 @@ with tab2:
         """)
     
     # 上傳檔案
-    uploaded_file = st.file_uploader("上傳 Excel 檔案", type=['xlsx', 'xls'], key="excel_upload")
+    uploaded_file = st.file_uploader("上傳 Excel 檔案", type=['xlsx', 'xls', 'csv'], key="excel_upload")
     
     if uploaded_file is not None:
         try:
-            # 讀取 Excel
-            df = pd.read_excel(uploaded_file)
+            # 讀取檔案
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                try:
+                    df = pd.read_excel(uploaded_file, engine='openpyxl')
+                except:
+                    try:
+                        df = pd.read_excel(uploaded_file)
+                    except Exception as e:
+                        st.error(f"❌ 無法讀取 Excel 檔案: {e}")
+                        st.info("💡 請確認已安裝 openpyxl: `pip install openpyxl`")
+                        st.stop()
             
-            st.success(f"✅ 成功讀取 Excel，共 {len(df)} 列資料")
+            st.success(f"✅ 成功讀取檔案，共 {len(df)} 列資料")
             
             # 顯示原始資料
             st.subheader("📊 原始資料預覽")
@@ -221,7 +290,7 @@ with tab2:
             
             # 檢查欄位
             if len(df.columns) < 2:
-                st.error("❌ Excel 至少需要 2 欄 (日期、股票代號)")
+                st.error("❌ 檔案至少需要 2 欄 (日期、股票代號)")
                 st.stop()
             
             # 重新命名欄位
@@ -414,25 +483,32 @@ with tab2:
                 # 提供下載
                 st.subheader("💾 下載更新後的檔案")
                 
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Sheet1')
+                output, file_format = create_excel_file(df)
                 
-                output.seek(0)
-                
-                st.download_button(
-                    label="📥 下載更新後的 Excel",
-                    data=output,
-                    file_name=f"updated_stock_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                if file_format == "xlsx":
+                    st.download_button(
+                        label="📥 下載更新後的 Excel",
+                        data=output,
+                        file_name=f"updated_stock_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.download_button(
+                        label="📥 下載更新後的 CSV",
+                        data=output,
+                        file_name=f"updated_stock_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
                 
         except Exception as e:
-            st.error(f"❌ 讀取或處理 Excel 時發生錯誤: {e}")
+            st.error(f"❌ 讀取或處理檔案時發生錯誤: {e}")
+            import traceback
+            with st.expander("查看詳細錯誤"):
+                st.code(traceback.format_exc())
     
     else:
         # 提供範例檔案
-        st.info("👆 請上傳 Excel 檔案開始使用")
+        st.info("👆 請上傳 Excel 或 CSV 檔案開始使用")
         
         with st.expander("📄 下載範例檔案"):
             sample_data = pd.DataFrame({
@@ -442,17 +518,39 @@ with tab2:
                 '交易值指標': [None] * 5
             })
             
-            sample_output = BytesIO()
-            with pd.ExcelWriter(sample_output, engine='openpyxl') as writer:
-                sample_data.to_excel(writer, index=False, sheet_name='Sheet1')
-            
-            sample_output.seek(0)
-            
-            st.write("下載範例 Excel 檔案，了解正確的格式：")
-            st.download_button(
-                label="📥 下載範例 Excel",
-                data=sample_output,
-                file_name="sample_stock_template.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="download_sample"
-            )
+            if EXCEL_ENGINES:
+                output, file_format = create_excel_file(sample_data)
+                
+                if file_format == "xlsx":
+                    st.write("下載範例 Excel 檔案：")
+                    st.download_button(
+                        label="📥 下載範例 Excel",
+                        data=output,
+                        file_name="sample_stock_template.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_sample"
+                    )
+                else:
+                    st.write("下載範例 CSV 檔案：")
+                    st.download_button(
+                        label="📥 下載範例 CSV",
+                        data=output,
+                        file_name="sample_stock_template.csv",
+                        mime="text/csv",
+                        key="download_sample"
+                    )
+            else:
+                # 直接提供 CSV
+                csv_output = BytesIO()
+                csv_data = sample_data.to_csv(index=False).encode('utf-8-sig')
+                csv_output.write(csv_data)
+                csv_output.seek(0)
+                
+                st.write("下載範例 CSV 檔案：")
+                st.download_button(
+                    label="📥 下載範例 CSV",
+                    data=csv_output,
+                    file_name="sample_stock_template.csv",
+                    mime="text/csv",
+                    key="download_sample"
+                )
